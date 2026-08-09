@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# Import critical dependencies gracefully
+# Core dependencies
 # -----------------------------------------------------------------------------
 
 try:
@@ -23,17 +23,33 @@ except Exception as e:
     st.stop()
 
 try:
-    import cv2
+    from PIL import Image, ImageDraw, ImageFont
 except Exception as e:
-    st.error(
-        "OpenCV import failed. This app requires opencv-python-headless. "
-        f"Error: {e}"
-    )
+    st.error(f"Pillow import failed: {e}")
     st.stop()
+
+# Optional OpenCV support.
+# The cloud-safe demo does NOT require OpenCV.
+CV2_AVAILABLE = False
+cv2 = None
+
+try:
+    import cv2 as _cv2
+
+    cv2 = _cv2
+    CV2_AVAILABLE = True
+except Exception:
+    cv2 = None
+
+
+try:
+    FONT = ImageFont.load_default()
+except Exception:
+    FONT = None
 
 
 # -----------------------------------------------------------------------------
-# Small Streamlit helper functions
+# Streamlit helpers
 # -----------------------------------------------------------------------------
 
 def rerun():
@@ -63,22 +79,22 @@ def show_image(img, caption=None, width=None, container=False):
 # -----------------------------------------------------------------------------
 
 SYNTH_SOURCE = "Synthetic orchard demo (live generated)"
-WEBCAM_SOURCE = "Webcam (local)"
-UPLOAD_SOURCE = "Uploaded video"
+WEBCAM_SOURCE = "Webcam (local, requires OpenCV)"
+UPLOAD_SOURCE = "Uploaded video (requires OpenCV)"
 
 RIPENESS_CLASSES = ["unripe", "ripe", "overripe"]
 
-# BGR colors for drawing
-RIPENESS_COLORS = {
+# RGB colors for drawing
+RIPENESS_COLORS_RGB = {
     "unripe": (0, 220, 0),
-    "ripe": (0, 210, 255),
-    "overripe": (80, 80, 220),
+    "ripe": (255, 210, 0),
+    "overripe": (220, 80, 80),
 }
 
-SYNTH_COLORS = {
+SYNTH_COLORS_RGB = {
     "unripe": (0, 190, 0),
-    "ripe": (0, 210, 255),
-    "overripe": (40, 70, 120),
+    "ripe": (255, 210, 0),
+    "overripe": (120, 70, 40),
 }
 
 # COCO fruit-ish class ids: banana, apple, orange
@@ -254,16 +270,12 @@ class SimpleByteTracker:
 
 
 # -----------------------------------------------------------------------------
-# Ripeness heuristic
+# Optional OpenCV-based ripeness heuristic
 # -----------------------------------------------------------------------------
 
-def classify_ripeness(crop):
+def classify_ripeness_cv2(crop):
     """
-    HSV-based ripeness heuristic.
-
-    This is intentionally lightweight and demo-friendly. In production, this
-    would be replaced by a fine-tuned ripeness classifier or a multimodal
-    ripeness model calibrated per crop.
+    HSV-based ripeness heuristic used only when OpenCV is available.
     """
     if crop is None or crop.size == 0:
         return "ripe", 0.30
@@ -295,19 +307,15 @@ def classify_ripeness(crop):
     s_mean = float(np.mean(hsv[:, :, 1]))
     v_mean = float(np.mean(hsv[:, :, 2]))
 
-    # Very dark / low-vitality regions are treated as overripe or decayed.
     if dark_ratio > 0.45 or v_mean < 80:
         return "overripe", 0.60
 
-    # Strong green signal -> unripe.
     if green_ratio > 0.35 and green_ratio >= red_ratio and green_ratio >= yellow_ratio:
         return "unripe", float(np.clip(0.40 + green_ratio, 0.0, 0.95))
 
-    # Dull red/brownish signal -> overripe.
     if v_mean < 130 and h_mean < 25 and (red_ratio > 0.15 or s_mean > 80):
         return "overripe", 0.60
 
-    # Strong red/yellow signal -> ripe.
     if red_ratio > 0.22 or yellow_ratio > 0.22:
         return "ripe", float(np.clip(0.40 + max(red_ratio, yellow_ratio), 0.0, 0.95))
 
@@ -324,7 +332,7 @@ def classify_ripeness(crop):
 
 
 # -----------------------------------------------------------------------------
-# Detection helpers
+# Optional OpenCV detection helpers
 # -----------------------------------------------------------------------------
 
 def nms(dets, thresh=0.40):
@@ -346,33 +354,29 @@ def nms(dets, thresh=0.40):
     return keep
 
 
-def detect_color(
+def detect_color_cv2(
     frame,
     min_area=500,
     min_circularity=0.30,
     min_conf=0.35,
 ):
     """
-    Heuristic color/blob detector used as the main lightweight detector and
-    as a fallback.
-
-    This is not a production detector. It exists so the demo can always show
-    live detection/tracking even without heavy ML dependencies.
+    Optional OpenCV color/blob detector.
+    Used only if OpenCV is installed locally.
     """
+    if not CV2_AVAILABLE:
+        return []
+
     h, w = frame.shape[:2]
 
     blur = cv2.GaussianBlur(frame, (7, 7), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
     ranges = [
-        # red
         ((0, 70, 60), (12, 255, 255)),
         ((168, 70, 60), (179, 255, 255)),
-        # yellow/orange
         ((13, 70, 70), (35, 255, 255)),
-        # green
         ((36, 50, 50), (85, 255, 255)),
-        # brownish/dull red
         ((8, 50, 60), (25, 230, 170)),
     ]
 
@@ -416,7 +420,7 @@ def detect_color(
             continue
 
         crop = frame[y : y + bh, x : x + bw]
-        ripeness, ripeness_conf = classify_ripeness(crop)
+        ripeness, ripeness_conf = classify_ripeness_cv2(crop)
 
         conf = float(
             np.clip(
@@ -449,9 +453,6 @@ def load_yolo_model(allow_download=False):
 
     This is deliberately optional because YOLO/ultralytics/torch are heavy
     dependencies and can cause deployment/installation failures.
-
-    If ultralytics is not installed, the app continues with the lightweight
-    heuristic detector.
     """
     try:
         from ultralytics import YOLO
@@ -462,7 +463,6 @@ def load_yolo_model(allow_download=False):
 
     for name in candidates:
         try:
-            # If download is disabled, only load weights that already exist locally.
             if os.path.exists(name) or allow_download:
                 model = YOLO(name)
                 return model, name
@@ -474,10 +474,8 @@ def load_yolo_model(allow_download=False):
 
 def detect_yolo(frame, model, conf_thresh):
     """
-    Detect fruit-like objects with an optional pre-trained YOLO model.
-
-    Ripeness is still estimated by HSV heuristic on the crop because generic
-    COCO weights do not include unripe/ripe/overripe classes.
+    Optional YOLO detector.
+    Used only if ultralytics is installed and enabled.
     """
     dets = []
 
@@ -551,7 +549,7 @@ def detect_yolo(frame, model, conf_thresh):
             continue
 
         crop = frame[y1:y2, x1:x2]
-        ripeness, _ = classify_ripeness(crop)
+        ripeness, _ = classify_ripeness_cv2(crop)
 
         dets.append(
             {
@@ -567,107 +565,105 @@ def detect_yolo(frame, model, conf_thresh):
 
 
 # -----------------------------------------------------------------------------
-# Visualization helpers
+# PIL visualization helpers
 # -----------------------------------------------------------------------------
 
-def draw_annotations(frame, tracks, show_mask=True):
+def draw_annotations(img, tracks, show_mask=True):
     """
-    Draw boxes, labels, and simulated SAM2-style mask ellipses.
+    Draw boxes, labels, and simulated SAM2-style mask ellipses using Pillow.
     """
-    out = frame.copy()
+    img = img.convert("RGB")
 
     if show_mask and tracks:
-        overlay = out.copy()
+        base = img.convert("RGBA")
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
 
         for t in tracks:
             x1, y1, x2, y2 = map(int, t.bbox)
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-            ax = max(4, (x2 - x1) // 2)
-            ay = max(4, (y2 - y1) // 2)
+            color = RIPENESS_COLORS_RGB.get(t.ripeness, (255, 255, 0))
+            od.ellipse(
+                [x1, y1, x2, y2],
+                fill=color + (70,),
+                outline=color + (120,),
+                width=2,
+            )
 
-            color = RIPENESS_COLORS.get(t.ripeness, (0, 255, 255))
-            cv2.ellipse(overlay, (cx, cy), (ax, ay), 0, 0, 360, color, -1)
+        img = Image.alpha_composite(base, overlay).convert("RGB")
 
-        out = cv2.addWeighted(overlay, 0.25, out, 0.75, 0)
+    draw = ImageDraw.Draw(img)
 
     for t in tracks:
         x1, y1, x2, y2 = map(int, t.bbox)
         if x2 <= x1 or y2 <= y1:
             continue
 
-        color = RIPENESS_COLORS.get(t.ripeness, (0, 255, 255))
+        color = RIPENESS_COLORS_RGB.get(t.ripeness, (255, 255, 0))
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
 
         label = f"#{t.id} {t.ripeness} {t.conf:.2f}"
+        ty = max(2, y1 + 2)
 
-        cv2.putText(
-            out,
-            label,
-            (x1, max(15, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (0, 0, 0),
-            3,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            out,
-            label,
-            (x1, max(15, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
+        draw.text((x1 + 1, ty + 1), label, fill=(0, 0, 0), font=FONT)
+        draw.text((x1, ty), label, fill=color, font=FONT)
 
-    return out
+    return img
 
 
-def pseudo_ndvi_panel(frame):
+def add_status_text(img, text):
+    img = img.convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    draw.text((6, 6), text, fill=(0, 0, 0), font=FONT)
+    draw.text((5, 5), text, fill=(0, 230, 0), font=FONT)
+
+    return img
+
+
+def colorize_index(idx):
+    """
+    Simple blue-green-red colorization for a normalized index.
+    """
+    x = idx.astype(np.float32) / 255.0
+
+    r = np.interp(x, [0.0, 0.5, 1.0], [0.0, 0.0, 255.0]).astype(np.uint8)
+    g = np.interp(x, [0.0, 0.5, 1.0], [0.0, 255.0, 0.0]).astype(np.uint8)
+    b = np.interp(x, [0.0, 0.5, 1.0], [255.0, 0.0, 0.0]).astype(np.uint8)
+
+    return np.stack([r, g, b], axis=-1)
+
+
+def pseudo_ndvi_panel(img):
     """
     Simulated RGB vegetation index panel.
 
-    This is NOT true NDVI because no NIR band is available. It uses a
-    green-red style index for demo visualization only.
+    This is NOT true NDVI because no NIR band is available.
     """
-    small = cv2.resize(frame, (220, 124))
-    b = small[:, :, 0].astype(np.float32)
-    g = small[:, :, 1].astype(np.float32)
-    r = small[:, :, 2].astype(np.float32)
+    small = img.resize((220, 124)).convert("RGB")
+    arr = np.asarray(small, dtype=np.float32)
+
+    r = arr[:, :, 0]
+    g = arr[:, :, 1]
 
     index = (g - r) / (g + r + 1e-6)
     index = np.clip((index + 1.0) * 127.5, 0, 255).astype(np.uint8)
 
-    heat = cv2.applyColorMap(index, cv2.COLORMAP_JET)
+    heat = colorize_index(index)
+    panel = Image.fromarray(heat)
 
-    cv2.putText(
-        heat,
-        "Simulated RGB vegetation index",
-        (5, 14),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.32,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        heat,
-        "No NIR band - not true NDVI",
-        (5, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.32,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
+    draw = ImageDraw.Draw(panel)
 
-    return heat
+    draw.text((4, 4), "Simulated RGB vegetation index", fill=(0, 0, 0), font=FONT)
+    draw.text((3, 3), "Simulated RGB vegetation index", fill=(255, 255, 255), font=FONT)
+
+    draw.text((4, 18), "No NIR band - not true NDVI", fill=(0, 0, 0), font=FONT)
+    draw.text((3, 17), "No NIR band - not true NDVI", fill=(255, 255, 255), font=FONT)
+
+    return panel
 
 
 # -----------------------------------------------------------------------------
@@ -679,8 +675,8 @@ class SyntheticScene:
     Generates a live synthetic orchard video with moving fruit blobs.
 
     This allows the demo to show live video immediately without requiring
-    a bundled video file, webcam permission, heavy ML packages, or internet
-    access.
+    OpenCV, heavy ML packages, bundled video files, webcam permission, or
+    internet access.
     """
 
     def __init__(self, width=640, height=360, count=6):
@@ -689,13 +685,14 @@ class SyntheticScene:
         self.frame_idx = 0
         self.fruits = []
 
-        self.bg = np.full((height, width, 3), (58, 56, 52), dtype=np.uint8)
+        self.bg = Image.new("RGB", (width, height), (58, 56, 52))
+        draw = ImageDraw.Draw(self.bg)
 
         # Subtle row lines.
         for y in range(0, height, 36):
-            cv2.line(self.bg, (0, y), (width, y), (46, 46, 46), 4)
+            draw.line((0, y, width, y), fill=(46, 46, 46), width=4)
 
-        # Small leaf-like dots. Kept small so the blob detector mostly ignores them.
+        # Small leaf-like dots.
         for _ in range(45):
             radius = random.randint(3, 8)
             x = random.randint(radius, width - radius)
@@ -705,7 +702,10 @@ class SyntheticScene:
                 random.randint(70, 110),
                 random.randint(18, 35),
             )
-            cv2.circle(self.bg, (x, y), radius, color, -1)
+            draw.ellipse(
+                [x - radius, y - radius, x + radius, y + radius],
+                fill=color,
+            )
 
         stages = RIPENESS_CLASSES
 
@@ -725,10 +725,14 @@ class SyntheticScene:
 
     def read(self):
         self.frame_idx += 1
-        frame = self.bg.copy()
+
+        img = self.bg.copy()
+        draw = ImageDraw.Draw(img)
+
+        detections = []
 
         for f in self.fruits:
-            # Slowly change ripeness to simulate a live ripening process.
+            # Slowly change ripeness.
             if self.frame_idx >= f["next_change"]:
                 order = RIPENESS_CLASSES
                 idx = order.index(f["ripeness"])
@@ -748,30 +752,44 @@ class SyntheticScene:
             f["x"] = max(f["r"], min(self.w - f["r"], f["x"]))
             f["y"] = max(f["r"], min(self.h - f["r"], f["y"]))
 
-            ix = int(f["x"])
-            iy = int(f["y"])
-            color = SYNTH_COLORS[f["ripeness"]]
+            x = int(f["x"])
+            y = int(f["y"])
+            r = int(f["r"])
 
-            # Shadow/border.
-            cv2.circle(frame, (ix, iy), f["r"], (25, 25, 25), -1)
+            color = SYNTH_COLORS_RGB[f["ripeness"]]
 
-            # Fruit body.
-            cv2.circle(frame, (ix, iy), max(4, f["r"] - 2), color, -1)
-
-            # Small highlight.
-            cv2.circle(
-                frame,
-                (ix - f["r"] // 3, iy - f["r"] // 3),
-                max(2, f["r"] // 5),
-                (170, 170, 170),
-                -1,
+            draw.ellipse(
+                [x - r, y - r, x + r, y + r],
+                fill=color,
+                outline=(25, 25, 25),
+                width=3,
             )
 
-        return True, frame
+            # Small highlight.
+            hr = max(2, r // 5)
+            hx = x - r // 3
+            hy = y - r // 3
+
+            draw.ellipse(
+                [hx - hr, hy - hr, hx + hr, hy + hr],
+                fill=(190, 190, 190),
+            )
+
+            detections.append(
+                {
+                    "bbox": [x - r, y - r, x + r, y + r],
+                    "conf": 0.88,
+                    "class": "synthetic-fruit",
+                    "ripeness": f["ripeness"],
+                    "source": "synthetic",
+                }
+            )
+
+        return img, detections
 
 
 # -----------------------------------------------------------------------------
-# Uploaded video helper
+# Optional OpenCV video reader
 # -----------------------------------------------------------------------------
 
 def get_uploaded_path(uploaded_file):
@@ -796,14 +814,13 @@ def get_uploaded_path(uploaded_file):
     return st.session_state.upload_paths[file_id]
 
 
-def read_frame(source, webcam_index, uploaded_file):
+def read_cv2_frame(source, webcam_index, uploaded_file):
     """
-    Read one frame from the selected source.
+    Read one BGR frame using OpenCV.
+    Only used when OpenCV is available.
     """
-    if source == SYNTH_SOURCE:
-        if st.session_state.get("scene") is None:
-            st.session_state.scene = SyntheticScene()
-        return st.session_state.scene.read()
+    if not CV2_AVAILABLE:
+        return False, None
 
     if source == WEBCAM_SOURCE:
         cap = st.session_state.get("cap")
@@ -823,29 +840,31 @@ def read_frame(source, webcam_index, uploaded_file):
 
         return True, frame
 
-    # Uploaded video.
-    path = get_uploaded_path(uploaded_file)
-    if not path or not os.path.exists(path):
-        return False, None
-
-    cap = st.session_state.get("cap")
-
-    if cap is None:
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
+    if source == UPLOAD_SOURCE:
+        path = get_uploaded_path(uploaded_file)
+        if not path or not os.path.exists(path):
             return False, None
-        st.session_state.cap = cap
 
-    ret, frame = cap.read()
+        cap = st.session_state.get("cap")
 
-    # Loop uploaded video.
-    if not ret or frame is None:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if cap is None:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                return False, None
+            st.session_state.cap = cap
+
         ret, frame = cap.read()
-        if not ret or frame is None:
-            return False, None
 
-    return True, frame
+        # Loop uploaded video.
+        if not ret or frame is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                return False, None
+
+        return True, frame
+
+    return False, None
 
 
 # -----------------------------------------------------------------------------
@@ -881,19 +900,29 @@ if "last_time" not in st.session_state:
 st.sidebar.title("AgriScan controls")
 
 st.sidebar.caption(
-    "This build uses a lightweight dependency set to avoid installer errors. "
-    "The core live demo runs without YOLO. YOLO is optional."
+    "Cloud-safe build: the core live demo runs without OpenCV, YOLO, or torch. "
+    "Webcam/upload support is enabled automatically only if OpenCV is installed."
 )
+
+source_options = [SYNTH_SOURCE]
+
+if CV2_AVAILABLE:
+    source_options.extend([WEBCAM_SOURCE, UPLOAD_SOURCE])
+else:
+    st.sidebar.info(
+        "OpenCV is not installed, so webcam/upload are disabled. "
+        "The synthetic live demo is running instead."
+    )
 
 source = st.sidebar.selectbox(
     "Input source",
-    [SYNTH_SOURCE, WEBCAM_SOURCE, UPLOAD_SOURCE],
+    source_options,
 )
 
 uploaded_file = None
 webcam_index = 0
 
-if source == WEBCAM_SOURCE:
+if source == WEBCAM_SOURCE and CV2_AVAILABLE:
     webcam_index = st.sidebar.number_input(
         "Webcam index",
         min_value=0,
@@ -902,7 +931,7 @@ if source == WEBCAM_SOURCE:
         step=1,
     )
 
-if source == UPLOAD_SOURCE:
+if source == UPLOAD_SOURCE and CV2_AVAILABLE:
     uploaded_file = st.sidebar.file_uploader(
         "Upload orchard/field video",
         type=["mp4", "mov", "avi", "mkv", "webm"],
@@ -921,7 +950,7 @@ source_key = f"{source}|{webcam_index if source == WEBCAM_SOURCE else uploaded_i
 
 # Reset capture/tracker when source changes.
 if st.session_state.source_key != source_key:
-    if st.session_state.cap is not None:
+    if st.session_state.cap is not None and CV2_AVAILABLE:
         try:
             st.session_state.cap.release()
         except Exception:
@@ -980,17 +1009,20 @@ target_fps = st.sidebar.slider(
     12,
 )
 
-use_yolo = st.sidebar.checkbox(
-    "Use optional YOLO detector if installed",
-    value=False,
-)
-
+use_yolo = False
 allow_yolo_download = False
-if use_yolo:
-    allow_yolo_download = st.sidebar.checkbox(
-        "Allow YOLO weights download if missing",
+
+if CV2_AVAILABLE:
+    use_yolo = st.sidebar.checkbox(
+        "Use optional YOLO detector if installed",
         value=False,
     )
+
+    if use_yolo:
+        allow_yolo_download = st.sidebar.checkbox(
+            "Allow YOLO weights download if missing",
+            value=False,
+        )
 
 show_mask = st.sidebar.checkbox(
     "Show simulated SAM2-style masks",
@@ -1002,21 +1034,15 @@ show_ndvi = st.sidebar.checkbox(
     value=True,
 )
 
-if source == SYNTH_SOURCE:
-    st.sidebar.info(
-        "Synthetic mode uses a lightweight heuristic detector so the demo always "
-        "runs live. Switch to Webcam or Uploaded video to try optional YOLO."
-    )
-
 
 # -----------------------------------------------------------------------------
 # Optional model loading
 # -----------------------------------------------------------------------------
 
 model = None
-model_info = "YOLO disabled (lightweight heuristic mode)"
+model_info = "YOLO disabled (lightweight mode)"
 
-if source != SYNTH_SOURCE and use_yolo:
+if source != SYNTH_SOURCE and CV2_AVAILABLE and use_yolo:
     model, model_info = load_yolo_model(allow_yolo_download)
 
 
@@ -1026,112 +1052,97 @@ if source != SYNTH_SOURCE and use_yolo:
 
 st.title("AgriScan Vision — Live Demo")
 st.caption(
-    "Demo focus: live fruit detection, ripeness labeling, tracking, unique counting, "
-    "and simulated vegetation-index visualization. Production would use fine-tuned "
-    "YOLOv10, SAM2, ByteTrack, GPS-aware mapping, and true RGB+NIR indices."
+    "Live demo: fruit detection, ripeness labeling, tracking, unique counting, "
+    "and simulated vegetation-index visualization. This cloud-safe version avoids "
+    "heavy dependencies by default."
 )
 
 left_col, right_col = st.columns([3, 2])
 
-ret, frame = read_frame(source, int(webcam_index), uploaded_file)
+ret = True
+img = None
+detections = []
+detector_used = "No detector"
 
-if not ret:
-    left_col.warning(
-        "No frame available. If using webcam, check camera permissions/index. "
-        "If using uploaded video, upload a valid video file. "
-        "You can always run the synthetic live demo."
-    )
+if source == SYNTH_SOURCE:
+    if st.session_state.get("scene") is None:
+        st.session_state.scene = SyntheticScene()
 
-    if st.session_state.cap is not None:
-        try:
-            st.session_state.cap.release()
-        except Exception:
-            pass
-        st.session_state.cap = None
-
-    st.session_state.running = False
+    img, detections = st.session_state.scene.read()
+    detector_used = "Synthetic ground-truth detector (cloud-safe demo)"
 
 else:
-    detections = []
-    detector_used = "No detector"
-
-    # Synthetic mode always uses heuristic detector for guaranteed live behavior.
-    if source == SYNTH_SOURCE:
-        detections = detect_color(
-            frame,
-            min_area=min_area,
-            min_circularity=min_circularity,
-            min_conf=conf_thresh,
+    if not CV2_AVAILABLE:
+        ret = False
+        left_col.warning(
+            "Webcam/upload requires OpenCV. Install opencv-python locally to enable it."
         )
-        detector_used = "Heuristic color detector (synthetic live demo)"
-
+        st.session_state.running = False
     else:
-        if model is not None:
-            detections = detect_yolo(frame, model, conf_thresh)
-            if detections:
-                detector_used = f"YOLO detector ({model_info})"
+        ret, bgr_frame = read_cv2_frame(source, int(webcam_index), uploaded_file)
 
-        if not detections:
-            detections = detect_color(
-                frame,
-                min_area=min_area,
-                min_circularity=min_circularity,
-                min_conf=conf_thresh,
-            )
+        if ret:
+            img = Image.fromarray(cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB))
 
             if model is not None:
-                detector_used = "Heuristic fallback (YOLO found no fruit)"
-            else:
-                detector_used = f"Heuristic detector ({model_info})"
+                detections = detect_yolo(bgr_frame, model, conf_thresh)
+                if detections:
+                    detector_used = f"YOLO detector ({model_info})"
 
-        if not detections and model is None:
-            detector_used = f"No detections ({model_info})"
+            if not detections:
+                detections = detect_color_cv2(
+                    bgr_frame,
+                    min_area=min_area,
+                    min_circularity=min_circularity,
+                    min_conf=conf_thresh,
+                )
 
+                if model is not None:
+                    detector_used = "Heuristic fallback (YOLO found no fruit)"
+                else:
+                    detector_used = f"Heuristic detector ({model_info})"
+
+            if not detections and model is None:
+                detector_used = f"No detections ({model_info})"
+        else:
+            left_col.warning(
+                "No frame available. Check webcam permissions/index or upload a valid video."
+            )
+
+            if st.session_state.cap is not None:
+                try:
+                    st.session_state.cap.release()
+                except Exception:
+                    pass
+                st.session_state.cap = None
+
+            st.session_state.running = False
+
+if ret and img is not None:
     tracker = st.session_state.tracker
     tracker.high_thresh = max(0.35, conf_thresh)
     tracker.low_thresh = max(0.05, conf_thresh - 0.25)
 
     active_tracks = tracker.update(detections)
 
-    annotated = draw_annotations(frame, active_tracks, show_mask=show_mask)
+    annotated = draw_annotations(img, active_tracks, show_mask=show_mask)
 
     status = (
         f"LIVE | {detector_used} | unique tracked: {tracker.confirmed_count}"
     )
 
-    cv2.putText(
-        annotated,
-        status,
-        (10, 22),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (0, 0, 0),
-        4,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        annotated,
-        status,
-        (10, 22),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
-        (0, 230, 0),
-        2,
-        cv2.LINE_AA,
-    )
-
-    annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+    annotated = add_status_text(annotated, status)
 
     with left_col:
         show_image(
-            annotated_rgb,
+            annotated,
             caption="Live annotated video",
             container=True,
         )
 
         if show_ndvi:
             show_image(
-                pseudo_ndvi_panel(frame),
+                pseudo_ndvi_panel(img),
                 caption="Simulated vegetation-index panel",
                 width=260,
             )
@@ -1188,9 +1199,10 @@ else:
 
         if source == SYNTH_SOURCE:
             fidelity = (
-                "Fidelity note: synthetic live video. Detection uses RGB color "
-                "heuristics, not YOLO. Ripeness is HSV heuristic. Masks are simulated "
-                "SAM2-style ellipses. Vegetation index is simulated from RGB only."
+                "Fidelity note: synthetic live video. Detections are generated from the "
+                "synthetic scene to guarantee a cloud-safe live demo. Ripeness labels are "
+                "part of the simulation. Masks are simulated SAM2-style ellipses. "
+                "Vegetation index is simulated from RGB only."
             )
         elif model is not None:
             fidelity = (
