@@ -1,6 +1,3 @@
 streamlit
-opencv-python
 numpy
-ultralytics
-torch
-torchvision
+opencv-python-headless

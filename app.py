@@ -4,8 +4,6 @@ import random
 import tempfile
 import time
 
-import cv2
-import numpy as np
 import streamlit as st
 
 st.set_page_config(
@@ -15,7 +13,27 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# Small Streamlit helper
+# Import critical dependencies gracefully
+# -----------------------------------------------------------------------------
+
+try:
+    import numpy as np
+except Exception as e:
+    st.error(f"NumPy import failed: {e}")
+    st.stop()
+
+try:
+    import cv2
+except Exception as e:
+    st.error(
+        "OpenCV import failed. This app requires opencv-python-headless. "
+        f"Error: {e}"
+    )
+    st.stop()
+
+
+# -----------------------------------------------------------------------------
+# Small Streamlit helper functions
 # -----------------------------------------------------------------------------
 
 def rerun():
@@ -335,10 +353,11 @@ def detect_color(
     min_conf=0.35,
 ):
     """
-    Heuristic color/blob detector used as a fallback and for the synthetic demo.
+    Heuristic color/blob detector used as the main lightweight detector and
+    as a fallback.
 
     This is not a production detector. It exists so the demo can always show
-    live detection/tracking even without downloaded YOLO weights.
+    live detection/tracking even without heavy ML dependencies.
     """
     h, w = frame.shape[:2]
 
@@ -424,13 +443,15 @@ def detect_color(
 
 
 @st.cache_resource(show_spinner=False)
-def load_yolo_model():
+def load_yolo_model(allow_download=False):
     """
-    Try to load a small pre-trained YOLO model.
+    Optional YOLO loader.
 
-    The demo first tries YOLOv10n, then falls back to YOLOv8n if needed.
-    If weights cannot be downloaded/local are unavailable, the app continues
-    with heuristic detection.
+    This is deliberately optional because YOLO/ultralytics/torch are heavy
+    dependencies and can cause deployment/installation failures.
+
+    If ultralytics is not installed, the app continues with the lightweight
+    heuristic detector.
     """
     try:
         from ultralytics import YOLO
@@ -441,17 +462,19 @@ def load_yolo_model():
 
     for name in candidates:
         try:
-            model = YOLO(name)
-            return model, name
+            # If download is disabled, only load weights that already exist locally.
+            if os.path.exists(name) or allow_download:
+                model = YOLO(name)
+                return model, name
         except Exception:
             continue
 
-    return None, "no YOLO weights available locally/download failed"
+    return None, "no local YOLO weights found"
 
 
 def detect_yolo(frame, model, conf_thresh):
     """
-    Detect fruit-like objects with a pre-trained YOLO model.
+    Detect fruit-like objects with an optional pre-trained YOLO model.
 
     Ripeness is still estimated by HSV heuristic on the crop because generic
     COCO weights do not include unripe/ripe/overripe classes.
@@ -656,7 +679,8 @@ class SyntheticScene:
     Generates a live synthetic orchard video with moving fruit blobs.
 
     This allows the demo to show live video immediately without requiring
-    a bundled video file, webcam permission, or internet access.
+    a bundled video file, webcam permission, heavy ML packages, or internet
+    access.
     """
 
     def __init__(self, width=640, height=360, count=6):
@@ -856,6 +880,11 @@ if "last_time" not in st.session_state:
 
 st.sidebar.title("AgriScan controls")
 
+st.sidebar.caption(
+    "This build uses a lightweight dependency set to avoid installer errors. "
+    "The core live demo runs without YOLO. YOLO is optional."
+)
+
 source = st.sidebar.selectbox(
     "Input source",
     [SYNTH_SOURCE, WEBCAM_SOURCE, UPLOAD_SOURCE],
@@ -929,7 +958,7 @@ conf_thresh = st.sidebar.slider(
 )
 
 min_area = st.sidebar.slider(
-    "Fallback blob min area",
+    "Blob min area",
     100,
     5000,
     500,
@@ -937,7 +966,7 @@ min_area = st.sidebar.slider(
 )
 
 min_circularity = st.sidebar.slider(
-    "Fallback min circularity",
+    "Min circularity",
     0.00,
     0.90,
     0.30,
@@ -952,14 +981,16 @@ target_fps = st.sidebar.slider(
 )
 
 use_yolo = st.sidebar.checkbox(
-    "Use YOLO detector when possible",
-    value=True,
+    "Use optional YOLO detector if installed",
+    value=False,
 )
 
-fallback_if_empty = st.sidebar.checkbox(
-    "Use heuristic fallback if YOLO finds nothing",
-    value=True,
-)
+allow_yolo_download = False
+if use_yolo:
+    allow_yolo_download = st.sidebar.checkbox(
+        "Allow YOLO weights download if missing",
+        value=False,
+    )
 
 show_mask = st.sidebar.checkbox(
     "Show simulated SAM2-style masks",
@@ -973,24 +1004,20 @@ show_ndvi = st.sidebar.checkbox(
 
 if source == SYNTH_SOURCE:
     st.sidebar.info(
-        "Synthetic mode uses a heuristic detector so the demo always runs live. "
-        "Switch to Webcam or Uploaded video to try YOLO."
-    )
-elif use_yolo:
-    st.sidebar.info(
-        "First YOLO use may download small pre-trained weights once."
+        "Synthetic mode uses a lightweight heuristic detector so the demo always "
+        "runs live. Switch to Webcam or Uploaded video to try optional YOLO."
     )
 
 
 # -----------------------------------------------------------------------------
-# Model loading
+# Optional model loading
 # -----------------------------------------------------------------------------
 
 model = None
-model_info = "YOLO skipped in synthetic demo mode"
+model_info = "YOLO disabled (lightweight heuristic mode)"
 
 if source != SYNTH_SOURCE and use_yolo:
-    model, model_info = load_yolo_model()
+    model, model_info = load_yolo_model(allow_yolo_download)
 
 
 # -----------------------------------------------------------------------------
@@ -1044,7 +1071,7 @@ else:
             if detections:
                 detector_used = f"YOLO detector ({model_info})"
 
-        if not detections and (fallback_if_empty or model is None):
+        if not detections:
             detections = detect_color(
                 frame,
                 min_area=min_area,
@@ -1055,7 +1082,7 @@ else:
             if model is not None:
                 detector_used = "Heuristic fallback (YOLO found no fruit)"
             else:
-                detector_used = f"Heuristic color detector ({model_info})"
+                detector_used = f"Heuristic detector ({model_info})"
 
         if not detections and model is None:
             detector_used = f"No detections ({model_info})"
@@ -1173,11 +1200,18 @@ else:
                 "from RGB only."
             )
         else:
-            fidelity = (
-                "Fidelity note: YOLO unavailable, so detection uses heuristic fallback. "
-                "Ripeness is HSV heuristic. Masks are simulated SAM2-style ellipses. "
-                "Vegetation index is simulated from RGB only."
-            )
+            if use_yolo:
+                fidelity = (
+                    f"Fidelity note: YOLO unavailable ({model_info}). Using lightweight "
+                    "heuristic detection. Ripeness is HSV heuristic. Masks are simulated "
+                    "SAM2-style ellipses. Vegetation index is simulated from RGB only."
+                )
+            else:
+                fidelity = (
+                    "Fidelity note: YOLO disabled. Using lightweight heuristic detection. "
+                    "Ripeness is HSV heuristic. Masks are simulated SAM2-style ellipses. "
+                    "Vegetation index is simulated from RGB only."
+                )
 
         st.caption(fidelity)
 
